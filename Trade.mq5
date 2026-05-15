@@ -16,9 +16,10 @@
 //   a hedging account. NETTING accounts are NOT supported — on a netting
 //   account you must not set req.position; the server nets automatically.
 //
-// [BROKER-SPECIFIC] Designed for IG Group / MT5 gateway, symbol SPX500(€).
-//   Several values are tuned for IG. Search [BROKER-SPECIFIC] to find all
-//   places that must be reviewed when switching broker or traded instrument.
+// [BROKER-SPECIFIC] Configured for FXIFY / FXPIG (Prime Intermarket Group
+//   Eurasia) MT5 server, symbol US500.r (S&P 500 Index CFD, raw spread).
+//   Account currency: USD. Search [BROKER-SPECIFIC] to find all places that
+//   must be reviewed when switching broker or traded instrument.
 //
 // STATE PERSISTENCE:
 //   All per-position state (initial lots, current stage, locked points, TP
@@ -35,43 +36,44 @@
 
 // ===================== Inputs =====================
 // [BROKER-SPECIFIC] DistancePts semantics are symbol-dependent.
-//   For SPX500(€) on IG: 1 input "point" == 1.0 price unit (index point).
-//   SYMBOL_POINT = 0.1 for SPX500(€); GetPointsFactorForSymbol returns
-//   factor=1.0, so DistancePts maps directly to price units.
-//   Example: DistancePts=10 → SL 10 price units from entry; each TP stage
-//   is spaced 10 price units apart.
-//   For FX or other instruments you must add a case in GetPointsFactorForSymbol
-//   and verify the DistancePts semantics match your quoting convention.
+//   For US500.r on FXPIG: 1 input "point" == 1.0 index point.
+//   SYMBOL_POINT = 0.01 for US500.r; GetPointsFactorForSymbol returns
+//   factor=1.0, so DistancePts maps directly to price units (index points).
+//   Example: DistancePts=10 → SL 10 index points from entry; each TP stage
+//   is spaced 10 index points apart.
+//   To add another symbol, add a case in GetPointsFactorForSymbol and verify
+//   the DistancePts semantics match the instrument's quoting convention.
 //
-// [BROKER-SPECIFIC] IG quirk: effective minimum stop distance can increase
-//   with position size. If entries are rejected at small DistancePts values,
-//   increase DistancePts or check SendMarketOrderGentleAdaptive retry output.
+// [BROKER-SPECIFIC] FXPIG/FXIFY: Stops level = 2 (symbol spec), so minimum
+//   SL distance is 2 × 0.01 = 0.02 price units. DistancePts=10 is well above
+//   this. The +1 guard in SendMarketOrderGentleAdaptive is harmless.
 enum TradeSideEnum { Buy = 1, Sell = -1 };
 input TradeSideEnum BUY_SELL   = Buy;                  // Buy / Sell
 input int           Contracts  = 2;                    // Contracts (each contract ≈ 1% initial risk, adds one TP stage)
 input double        DistancePts= 10.0;                 // Initial SL distance & per-stage TP spacing (in symbol "points")
 
 // ===================== Fixed settings =====================
-#define PRINT_DEBUG           true    // Print diagnostic messages to the journal (set false for live trading)
+#define PRINT_DEBUG           true    // Print diagnostic messages to the journal — SET FALSE before leaving trade unattended
 
 // [BROKER-SPECIFIC] MAGIC: unique numeric identifier for this EA's orders.
 //   The EA uses MAGIC to distinguish its own positions from manual trades or
 //   other EAs. If running multiple EA instances on the same account, each
 //   must have a DIFFERENT MAGIC number to avoid cross-contamination.
-#define MAGIC                 246810
+#define MAGIC                 246811
 
 // [BROKER-SPECIFIC] Maximum slippage tolerance in broker "points" (multiples
-//   of SYMBOL_POINT). For SPX500(€): 3 points = 0.3 price units.
-//   Increase if entries/closes are frequently rejected during fast markets.
-//   Decrease for tighter fills. Maps to req.deviation in MqlTradeRequest.
-#define SLIPPAGE_POINTS       3
+//   of SYMBOL_POINT). For US500.r on FXPIG: 30 points = 0.30 price units
+//   (index points) — equivalent real tolerance to the prior IG setup.
+//   Increase if fills are frequently rejected during fast markets.
+//   Maps to req.deviation in MqlTradeRequest.
+#define SLIPPAGE_POINTS       30
 
 // [BROKER-SPECIFIC] Retry configuration for transient server errors (requote,
-//   price-changed, connection loss, timeout). 5 attempts × 180 ms ≈ 900 ms.
-//   Tuned for IG's MT5 gateway. A lower delay may be fine on faster brokers;
-//   a higher count may be needed on unstable connections.
+//   price-changed, connection loss, timeout). 5 attempts × 100 ms = 500 ms.
+//   FXPIG is a standard ECN gateway with lower latency than IG; 100 ms is
+//   sufficient. Increase on unstable connections.
 #define ENTRY_RETRY_ATTEMPTS  5
-#define ENTRY_RETRY_DELAY_MS  180
+#define ENTRY_RETRY_DELAY_MS  100
 
 const color TP_COLOR         = clrDodgerBlue;  // Colour for all TP horizontal lines on the chart
 
@@ -103,7 +105,7 @@ string SanitizeKey(string s){
 string GV_WasActiveKey(){
   string sym = SanitizeKey(Symbol());         // sanitise symbol name for GV key
   string side = (BUY_SELL==Buy ? "BUY" : "SELL");
-  return "EA_WAS_ACTIVE_" + sym + "_" + side; // e.g. "EA_WAS_ACTIVE_SPX500__EUR__BUY"
+  return "EA_WAS_ACTIVE_" + sym + "_" + side; // e.g. "EA_WAS_ACTIVE_US500_r_BUY"
 }
 bool GetWasActive(){
   string k = GV_WasActiveKey();
@@ -121,10 +123,10 @@ void SetWasActive(){
 //
 // [BROKER-SPECIFIC] *** MUST BE UPDATED FOR EVERY NEW SYMBOL ***
 //
-// SPX500(€) on IG:
-//   SYMBOL_POINT = 0.1 (price quoted to 1 decimal place, e.g. 5280.3).
+// US500.r on FXPIG:
+//   SYMBOL_POINT = 0.01 (price quoted to 2 decimal places, e.g. 5280.35).
 //   User inputs DistancePts in index points (e.g. 10 = a 10-point move).
-//   A 10-index-point move = 100 SYMBOL_POINTs. Setting factor=1.0 treats
+//   A 10-index-point move = 1000 SYMBOL_POINTs. Setting factor=1.0 treats
 //   DistancePts as raw price units, which equals index points for this symbol
 //   (10.0 / 1.0 = 10.0 price units ✓).
 //
@@ -133,8 +135,9 @@ void SetWasActive(){
 //     If DistancePts is in pips, factor = 0.0001/SYMBOL_POINT = 10.0.
 //   US30/Wall Street: SYMBOL_POINT varies by broker; verify empirically.
 bool GetPointsFactorForSymbol(const string sym, double &factor){
-  // [BROKER-SPECIFIC] SPX500(€) on IG: 1 input point == 1.0 price unit.
-  if(ContainsNoCase(sym, "SPX500(")) { factor = 1.0; return true; }
+  // [BROKER-SPECIFIC] US500.r on FXPIG: 1 input point == 1.0 price unit (index point).
+  // ContainsNoCase matches US500, US500.r, US500.a, etc. — suffix-agnostic.
+  if(ContainsNoCase(sym, "US500")) { factor = 1.0; return true; }
   // Add further symbol mappings here as needed.
   return false;  // unknown symbol → EA refuses to start
 }
@@ -265,34 +268,28 @@ void CleanupTicketGVs(const ulong ticket){
 // and the request should be retried. A "hard" error (invalid volume, invalid
 // symbol, market closed, etc.) returns false and the caller aborts immediately.
 //
-// [BROKER-SPECIFIC] TRADE_RETCODE_REJECT is included because IG's MT5 gateway
-// maps the legacy MT4 "trade context busy" error (146) to this retcode. On
-// some other brokers TRADE_RETCODE_REJECT is a hard non-transient refusal
-// (the server explicitly rejected the request); if so, remove it from this list
-// and handle it as a permanent failure.
+// [BROKER-SPECIFIC] FXPIG is a standard MT5 ECN broker. TRADE_RETCODE_REJECT
+// (10006) is a hard server refusal here — NOT transient — so it is excluded.
+// (On IG's custom gateway it was transient, mapping to MT4 error 146.)
 bool IsTransientRetcode(const int retcode){
   return (retcode==TRADE_RETCODE_REQUOTE      ||
           retcode==TRADE_RETCODE_PRICE_CHANGED ||
           retcode==10021                        ||  // TRADE_RETCODE_PRICE_OFF (not in all MT5 builds)
           retcode==10031                        ||  // TRADE_RETCODE_CONNECTION (not in all MT5 builds)
-          retcode==TRADE_RETCODE_TIMEOUT       ||
-          retcode==TRADE_RETCODE_REJECT);       // IG: maps to MT4 error 146 (context busy)
+          retcode==TRADE_RETCODE_TIMEOUT);
 }
 
 // GetFillMode: queries the symbol for its supported order-filling modes and
 // returns the best available one (FOK > IOC > RETURN).
 //
-// [BROKER-SPECIFIC] IG's MT5 gateway reports SYMBOL_FILLING_MODE=0 for
-// SPX500(€), meaning neither FOK nor IOC bits are set. GetFillMode therefore
-// falls through to ORDER_FILLING_RETURN, which IG accepts for market orders.
-// Some brokers only support FOK; if RETURN is rejected you will see
-// TRADE_RETCODE_UNSUPPORTED — in that case remove the RETURN fallback and
-// handle the case where no mode is advertised separately.
+// [BROKER-SPECIFIC] FXPIG/US500.r advertises both FOK and IOC in the symbol
+// spec. GetFillMode will auto-select FOK (preferred). The RETURN fallback is
+// kept for safety on any future symbol that reports filling mode = 0.
 ENUM_ORDER_TYPE_FILLING GetFillMode(const string sym){
   int filling = (int)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
   if((filling & (int)SYMBOL_FILLING_FOK) != 0) return ORDER_FILLING_FOK;
   if((filling & (int)SYMBOL_FILLING_IOC) != 0) return ORDER_FILLING_IOC;
-  return ORDER_FILLING_RETURN;  // [BROKER-SPECIFIC] IG default (filling mode = 0)
+  return ORDER_FILLING_RETURN;  // fallback for symbols with filling mode = 0
 }
 
 // CloseGentle: closes 'lots' of position posTicket via an opposing market order.
@@ -321,9 +318,7 @@ ENUM_ORDER_TYPE_FILLING GetFillMode(const string sym){
 //   req.position set, these are ignored — the broker keeps the original
 //   position's SL/TP intact through all partial closes.
 //
-// [BROKER-SPECIFIC] Sleep(120): the 120 ms retry delay is tuned for IG's
-//   gateway. On faster brokers a shorter delay (e.g. 50 ms) would be fine;
-//   on slower/noisier connections you may need a longer one.
+// [BROKER-SPECIFIC] Sleep(100): retry delay for FXPIG's standard ECN gateway.
 bool CloseGentle(const string sym, ulong posTicket, double lots,
                  bool useBidPrice, double triggerPrice,
                  int baseSlippage, double &execPrice, int attemptsPerTick=2)
@@ -351,7 +346,7 @@ bool CloseGentle(const string sym, ulong posTicket, double lots,
       return true;
     }
     if(!IsTransientRetcode((int)res.retcode)) return false;
-    Sleep(120);  // [BROKER-SPECIFIC] 120 ms retry delay tuned for IG gateway latency
+    Sleep(100);  // [BROKER-SPECIFIC] 100 ms retry delay for FXPIG gateway
   }
   return false;
 }
@@ -406,9 +401,17 @@ ulong SendMarketOrderGentleAdaptive(const string sym, ENUM_ORDER_TYPE type, doub
     double sl = (type==ORDER_TYPE_BUY ? entry - stopDelta : entry + stopDelta);
     sl = NormalizeDouble(sl, digits);
 
+    if(PRINT_DEBUG) Print("Entry attempt ",a,"/",attempts,
+                          ": ",(type==ORDER_TYPE_BUY?"BUY":"SELL"),
+                          " lots=",DoubleToString(lots,4),
+                          " entry=",DoubleToString(entry,digits),
+                          " sl=",DoubleToString(sl,digits),
+                          " stopDistBrokerPts=",DoubleToString(MathAbs(stopDelta/SymbolInfoDouble(sym,SYMBOL_POINT)),1),
+                          " stopLevel=",stopLevel);
+
     // Require >= stopLevel+1 broker-points of SL distance (see function comment above).
-    // [BROKER-SPECIFIC] The +1 is an IG-specific guard against the effective minimum
-    // stop distance exceeding SYMBOL_TRADE_STOPS_LEVEL at certain position sizes.
+    // For US500.r on FXPIG: stopLevel=2, so this requires >=3 broker points (0.03 price
+    // units). Harmless: any practical DistancePts value places the SL far above this.
     double stopDistPts = MathAbs(stopDelta / point);
     if(stopDistPts < stopLevel + 1){
       if(PRINT_DEBUG) Print("Entry retry ",a,": SL too close for broker. Need >=",stopLevel+1," pts, have ",DoubleToString(stopDistPts,1));
@@ -785,17 +788,18 @@ void UpdatePanel(const bool tradeActive){
 //      dragged positions), validate GV state.
 //   5. Draw the panel for the initial state.
 //
-// [BROKER-SPECIFIC] Lot sizing formula:
-//   riskAmt = balance × (Contracts / 100.0)   ← 1% of balance per contract
-//   lots    = FloorToLotStep(riskAmt / distPts)
+// [BROKER-SPECIFIC] Lot sizing formula (US500.r on FXPIG, USD account):
+//   riskAmt  = balance × (Contracts / 100.0)   ← 1% of balance per contract
+//   valPerPt = SYMBOL_TRADE_TICK_VALUE / SYMBOL_TRADE_TICK_SIZE
+//            ≈ $100 USD per lot per index point (contract size 100, tick size 0.01)
+//   lots     = FloorToLotStep(riskAmt / (valPerPt × distPts))
 //
-//   This is calibrated for SPX500(€) on IG where each lot is worth roughly
-//   £1/point in account currency. Contracts=2, DistancePts=10 →
-//   riskAmt = balance × 0.02; lots = riskAmt / 10.
-//   For FX or other instruments the sizing formula must be replaced with a
-//   proper pip-value-based calculation:
-//     lots = (balance × riskPct) / (pipValue × stopLossInPips)
-//   where pipValue = lotSize × SYMBOL_POINT × ContractSize / exchangeRate.
+//   Example: balance=$10,000, Contracts=2, DistancePts=10:
+//     riskAmt=$200; lots = 200 / (100 × 10) = 0.20 lots
+//     0.20 lots × 10 pts × $100/lot/pt = $200 risk ✓
+//
+//   Using SYMBOL_TRADE_TICK_VALUE keeps this self-calibrating — MT5 computes
+//   the per-lot USD value dynamically, so no hardcoded contract size is needed.
 int OnInit(){
   string sym     = Symbol();
   double point   = SymbolInfoDouble(sym, SYMBOL_POINT);
@@ -825,9 +829,28 @@ int OnInit(){
 
   ulong posTicket = FindManagedPositionTicket(sym, wantType);
   if(posTicket==0){
-    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-    double riskAmt = balance * (Contracts / 100.0);
-    double lots    = FloorToLotStep(riskAmt / distPts, (lotStep>0 ? lotStep : 0.01));
+    double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
+    double riskAmt  = balance * (Contracts / 100.0);
+    // [BROKER-SPECIFIC] Tick-value-based sizing for US500.r (contract size 100).
+    // SYMBOL_TRADE_TICK_VALUE / SYMBOL_TRADE_TICK_SIZE = USD value per lot per 1 index point.
+    // MT5 computes this from the symbol spec; no hardcoded multiplier needed.
+    double tickVal  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+    double tickSize = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+    double valPerPt = (tickSize > 0.0 && tickVal > 0.0) ? (tickVal / tickSize) : 0.0;
+    double lots;
+    if(valPerPt > 0.0){
+      lots = FloorToLotStep(riskAmt / (valPerPt * distPts), (lotStep>0 ? lotStep : 0.01));
+    }else{
+      Print("Init: SYMBOL_TRADE_TICK_VALUE unavailable; defaulting to minLot. Check symbol is subscribed.");
+      lots = minLot;
+    }
+    if(PRINT_DEBUG) Print("Init sizing: balance=",DoubleToString(balance,2),
+                          " riskAmt=",DoubleToString(riskAmt,2),
+                          " tickVal=",DoubleToString(tickVal,5),
+                          " tickSize=",DoubleToString(tickSize,5),
+                          " valPerPt=",DoubleToString(valPerPt,4),
+                          " distPts=",DoubleToString(distPts,2),
+                          " raw lots=",DoubleToString(lots,4));
     if(lots < minLot) lots = minLot;
 
     // Cap lots to broker maximum volume. Without this, oversized lots cause an
@@ -837,14 +860,17 @@ int OnInit(){
       Print("Init: lots ",DoubleToString(lots,2)," capped to SYMBOL_VOLUME_MAX ",DoubleToString(maxLot,2));
       lots = maxLot;
     }
+    if(PRINT_DEBUG) Print("Init: final lots=",DoubleToString(lots,4),
+                          " (min=",DoubleToString(minLot,4),
+                          " max=",DoubleToString(maxLot,4),
+                          " step=",DoubleToString(lotStep,4),")");
 
   // Open new position — size, cap, and send.
-  // [BROKER-SPECIFIC] "SPX" is the order comment visible in IG's trade blotter
-  // and MT5 history. Change to match your preferred instrument/strategy label.
-  // Some brokers restrict comment length or content; IG accepts short strings.
+  // [BROKER-SPECIFIC] "US500" is the order comment visible in FXPIG's trade
+  // history. FXIFY prop accounts accept short alphanumeric comment strings.
     ENUM_ORDER_TYPE type = (BUY_SELL==Buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
     posTicket = SendMarketOrderGentleAdaptive(sym, type, lots, distPts, factor,
-                                             SLIPPAGE_POINTS, "SPX", MAGIC,
+                                             SLIPPAGE_POINTS, "US500", MAGIC,
                                              ENTRY_RETRY_ATTEMPTS, ENTRY_RETRY_DELAY_MS);
     if(posTicket==0){
       Print("Init: ",(type==ORDER_TYPE_BUY?"BUY":"SELL")," failed after retries.");
