@@ -427,18 +427,13 @@ ulong SendMarketOrderGentleAdaptive(const string sym, ENUM_ORDER_TYPE type, doub
     req.comment      = comment;
     req.type_filling = fillMode;
     if(OrderSend(req,res) && res.retcode==TRADE_RETCODE_DONE){
-      // Normal path: res.position holds the resulting position ticket.
-      if(res.position > 0) return (ulong)res.position;
-      // Fallback: [BROKER-SPECIFIC] IG's MT5 gateway sometimes leaves
-      // res.position=0 even on TRADE_RETCODE_DONE (it only populates res.deal).
-      // The fill is confirmed, so the position must be visible immediately;
-      // search by symbol/direction/MAGIC to recover the ticket.
-      // Standard MT5 brokers always populate res.position correctly; this
-      // fallback is harmless but unnecessary on non-IG setups.
+      // Search for the resulting position by symbol/direction/MAGIC.
+      // This handles both standard brokers and IG's gateway, which sometimes
+      // does not populate res.position even on a successful fill.
       ENUM_POSITION_TYPE wantPos = (type==ORDER_TYPE_BUY ? POSITION_TYPE_BUY : POSITION_TYPE_SELL);
       ulong recovered = FindManagedPositionTicket(sym, wantPos);
       if(recovered > 0) return recovered;
-      if(PRINT_DEBUG) Print("Entry: TRADE_RETCODE_DONE but res.position=0 and fallback search failed.");
+      if(PRINT_DEBUG) Print("Entry: TRADE_RETCODE_DONE but position search failed.");
       return 0;
     }
     if(!IsTransientRetcode((int)res.retcode)){
