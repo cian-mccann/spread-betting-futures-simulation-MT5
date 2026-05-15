@@ -78,7 +78,7 @@ const color TP_COLOR         = clrDodgerBlue;  // Colour for all TP horizontal l
 // ===================== Helpers =====================
 bool ObjExists(const string name){ return (ObjectFind(0,name) != -1); }
 void DeleteIfExists(const string name){ if(ObjExists(name)) ObjectDelete(0,name); }
-bool ContainsNoCase(string hay, string needle){ hay=StringToUpper(hay); needle=StringToUpper(needle); return (StringFind(hay,needle,0)!=-1); }
+bool ContainsNoCase(string hay, string needle){ StringToUpper(hay); StringToUpper(needle); return (StringFind(hay,needle,0)!=-1); }
 // FloorToLotStep: round DOWN to the nearest lot-step multiple (used for position sizing to never exceed budget).
 double FloorToLotStep(double lots,double step){ if(step<=0) return lots; return MathFloor(lots/step)*step; }
 // RoundToLotStep: round to nearest lot-step multiple (used for piece calculation; ties round up).
@@ -261,25 +261,69 @@ void CleanupTicketGVs(const ulong ticket){
 }
 
 // ===================== Trade utilities =====================
-bool IsTransientRetcode(const uint retcode){
+// IsTransientRetcode: returns true if the server error is likely temporary
+// and the request should be retried. A "hard" error (invalid volume, invalid
+// symbol, market closed, etc.) returns false and the caller aborts immediately.
+//
+// [BROKER-SPECIFIC] TRADE_RETCODE_REJECT is included because IG's MT5 gateway
+// maps the legacy MT4 "trade context busy" error (146) to this retcode. On
+// some other brokers TRADE_RETCODE_REJECT is a hard non-transient refusal
+// (the server explicitly rejected the request); if so, remove it from this list
+// and handle it as a permanent failure.
+bool IsTransientRetcode(const int retcode){
   return (retcode==TRADE_RETCODE_REQUOTE      ||
           retcode==TRADE_RETCODE_PRICE_CHANGED ||
-          retcode==TRADE_RETCODE_PRICE_OFF     ||
-          retcode==TRADE_RETCODE_CONNECTION    ||
+          retcode==10021                        ||  // TRADE_RETCODE_PRICE_OFF (not in all MT5 builds)
+          retcode==10031                        ||  // TRADE_RETCODE_CONNECTION (not in all MT5 builds)
           retcode==TRADE_RETCODE_TIMEOUT       ||
-          retcode==TRADE_RETCODE_REJECT);
+          retcode==TRADE_RETCODE_REJECT);       // IG: maps to MT4 error 146 (context busy)
 }
 
-// Determine the best filling mode supported by the symbol.
+// GetFillMode: queries the symbol for its supported order-filling modes and
+// returns the best available one (FOK > IOC > RETURN).
+//
+// [BROKER-SPECIFIC] IG's MT5 gateway reports SYMBOL_FILLING_MODE=0 for
+// SPX500(€), meaning neither FOK nor IOC bits are set. GetFillMode therefore
+// falls through to ORDER_FILLING_RETURN, which IG accepts for market orders.
+// Some brokers only support FOK; if RETURN is rejected you will see
+// TRADE_RETCODE_UNSUPPORTED — in that case remove the RETURN fallback and
+// handle the case where no mode is advertised separately.
 ENUM_ORDER_TYPE_FILLING GetFillMode(const string sym){
   int filling = (int)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
   if(filling & (int)SYMBOL_FILLING_FOK) return ORDER_FILLING_FOK;
   if(filling & (int)SYMBOL_FILLING_IOC) return ORDER_FILLING_IOC;
-  return ORDER_FILLING_RETURN;
+  return ORDER_FILLING_RETURN;  // [BROKER-SPECIFIC] IG default (filling mode = 0)
 }
 
-// Gentle partial/full close via opposing deal on a hedging account.
-// BUY position closes with ORDER_TYPE_SELL at Bid; SELL position closes with ORDER_TYPE_BUY at Ask.
+// CloseGentle: closes 'lots' of position posTicket via an opposing market order.
+// Returns true and sets execPrice on success; returns false on failure.
+//
+// Parameters:
+//   sym          – symbol (e.g. "SPX500(€)")
+//   posTicket    – ticket of the position being partially closed
+//   lots         – volume to close (must be <= position volume)
+//   useBidPrice  – true for BUY position (close at Bid), false for SELL (close at Ask)
+//   triggerPrice – the TP line price; closing is refused if price has reverted
+//                  back through this level between TP detection and order send
+//   baseSlippage – req.deviation in broker points (see SLIPPAGE_POINTS)
+//   execPrice    – output: actual fill price (res.price if available, else bid/ask used)
+//   attemptsPerTick – how many times to retry transient errors within this call
+//
+// [BROKER-SPECIFIC — ACCOUNT MODEL: HEDGING ONLY]
+//   Partial closes are implemented as TRADE_ACTION_DEAL with req.position set.
+//   This is the correct MT5 hedging-account mechanism for reducing a position:
+//     BUY  position → close with ORDER_TYPE_SELL at current Bid
+//     SELL position → close with ORDER_TYPE_BUY  at current Ask
+//   On a NETTING account you must NOT set req.position (or use a different
+//   action); the server nets opposing deals automatically.
+//
+//   req.sl and req.tp are left zero (zero-init). For TRADE_ACTION_DEAL with
+//   req.position set, these are ignored — the broker keeps the original
+//   position's SL/TP intact through all partial closes.
+//
+// [BROKER-SPECIFIC] Sleep(120): the 120 ms retry delay is tuned for IG's
+//   gateway. On faster brokers a shorter delay (e.g. 50 ms) would be fine;
+//   on slower/noisier connections you may need a longer one.
 bool CloseGentle(const string sym, ulong posTicket, double lots,
                  bool useBidPrice, double triggerPrice,
                  int baseSlippage, double &execPrice, int attemptsPerTick=2)
@@ -301,20 +345,42 @@ bool CloseGentle(const string sym, ulong posTicket, double lots,
     req.magic        = (ulong)MAGIC;
     req.type_filling = fillMode;
     if(OrderSend(req,res) && res.retcode==TRADE_RETCODE_DONE){
-      // res.price: use actual fill if available; fall back to the bid/ask we sent (matches MQ4 behaviour).
+      // Use the actual fill price if reported; fall back to the bid/ask we sent.
+      // res.price is occasionally zero on IG even for successful fills.
       execPrice = (res.price > 0.0) ? res.price : price;
       return true;
     }
-    if(!IsTransientRetcode(res.retcode)) return false;
-    Sleep(120);
+    if(!IsTransientRetcode((int)res.retcode)) return false;
+    Sleep(120);  // [BROKER-SPECIFIC] 120 ms retry delay tuned for IG gateway latency
   }
   return false;
 }
 
-// Entry order with adaptive SL enforcement and transient-error retry.
-// Returns position ticket on success, 0 on failure.
-// IG quirk: SYMBOL_TRADE_STOPS_LEVEL may understate the effective minimum for large sizes.
-// Strategy: recompute entry+SL per attempt, enforce stop level every time, retry transient retcodes.
+// SendMarketOrderGentleAdaptive: places a market entry order with SL.
+// Retries transient errors up to 'attempts' times; recomputes entry/SL price
+// from live bid/ask on each attempt to stay current during fast markets.
+// Returns the resulting position ticket on success, or 0 on failure.
+//
+// Parameters:
+//   sym          – symbol to trade
+//   type         – ORDER_TYPE_BUY or ORDER_TYPE_SELL
+//   lots         – position size (already sized and capped by OnInit)
+//   distPts      – user's DistancePts input
+//   factor       – from GetPointsFactorForSymbol (price-units-per-point)
+//   slippagePts  – max slippage in broker points (SLIPPAGE_POINTS)
+//   comment      – order comment string (e.g. "SPX")
+//   magic        – EA magic number
+//   attempts     – maximum retry count (ENTRY_RETRY_ATTEMPTS)
+//   sleepMs      – delay between retries in ms (ENTRY_RETRY_DELAY_MS)
+//
+// SL enforcement:
+//   stopDelta = distPts / factor (price units)
+//   SL must be >= stopLevel + 1 points from entry.
+//   [BROKER-SPECIFIC] The +1 guard is an IG quirk: the effective broker minimum
+//   stop distance can exceed SYMBOL_TRADE_STOPS_LEVEL at larger sizes. The extra
+//   point prevents the SL landing exactly at the minimum and being invalidated
+//   by tick movement between calculation and order dispatch.
+//   On brokers with predictable STOPLEVEL reporting, the +1 is still safe.
 ulong SendMarketOrderGentleAdaptive(const string sym, ENUM_ORDER_TYPE type, double lots,
                                     double distPts, double factor,
                                     int slippagePts,
@@ -340,7 +406,9 @@ ulong SendMarketOrderGentleAdaptive(const string sym, ENUM_ORDER_TYPE type, doub
     double sl = (type==ORDER_TYPE_BUY ? entry - stopDelta : entry + stopDelta);
     sl = NormalizeDouble(sl, digits);
 
-    // Require >= stopLevel+1 points of SL distance to avoid rounding/tick-lag edge cases.
+    // Require >= stopLevel+1 broker-points of SL distance (see function comment above).
+    // [BROKER-SPECIFIC] The +1 is an IG-specific guard against the effective minimum
+    // stop distance exceeding SYMBOL_TRADE_STOPS_LEVEL at certain position sizes.
     double stopDistPts = MathAbs(stopDelta / point);
     if(stopDistPts < stopLevel + 1){
       if(PRINT_DEBUG) Print("Entry retry ",a,": SL too close for broker. Need >=",stopLevel+1," pts, have ",DoubleToString(stopDistPts,1));
@@ -361,15 +429,19 @@ ulong SendMarketOrderGentleAdaptive(const string sym, ENUM_ORDER_TYPE type, doub
     if(OrderSend(req,res) && res.retcode==TRADE_RETCODE_DONE){
       // Normal path: res.position holds the resulting position ticket.
       if(res.position > 0) return (ulong)res.position;
-      // Fallback: some MT5 gateways (e.g. IG) populate res.deal but leave res.position=0.
-      // Search the position list — the fill is confirmed, so it must be visible immediately.
+      // Fallback: [BROKER-SPECIFIC] IG's MT5 gateway sometimes leaves
+      // res.position=0 even on TRADE_RETCODE_DONE (it only populates res.deal).
+      // The fill is confirmed, so the position must be visible immediately;
+      // search by symbol/direction/MAGIC to recover the ticket.
+      // Standard MT5 brokers always populate res.position correctly; this
+      // fallback is harmless but unnecessary on non-IG setups.
       ENUM_POSITION_TYPE wantPos = (type==ORDER_TYPE_BUY ? POSITION_TYPE_BUY : POSITION_TYPE_SELL);
       ulong recovered = FindManagedPositionTicket(sym, wantPos);
       if(recovered > 0) return recovered;
       if(PRINT_DEBUG) Print("Entry: TRADE_RETCODE_DONE but res.position=0 and fallback search failed.");
       return 0;
     }
-    if(!IsTransientRetcode(res.retcode)){
+    if(!IsTransientRetcode((int)res.retcode)){
       if(PRINT_DEBUG) Print("Entry failed. retcode=",res.retcode);
       return 0;
     }
@@ -380,6 +452,10 @@ ulong SendMarketOrderGentleAdaptive(const string sym, ENUM_ORDER_TYPE type, doub
 }
 
 // ===================== TP utilities =====================
+// StagePriceFromEntry: computes the price level of TP stage 'stage' using the
+// arithmetic formula: entry ± (intervalPts * stage) / factor.
+// For a BUY, TP levels step up above entry; for a SELL, they step down.
+// All stages are equally spaced by intervalPts price units.
 double StagePriceFromEntry(const bool isBuy, const double entry, const int stage,
                            const double intervalPts, const double factor)
 {
@@ -387,8 +463,18 @@ double StagePriceFromEntry(const bool isBuy, const double entry, const int stage
   return isBuy ? entry + delta : entry - delta;
 }
 
-// Creates/restores TP lines for stages nextStage..totalStages.
-// If a saved GV price exists (from a prior drag or deinit), it takes precedence over the formula.
+// EnsureTPLines: creates or restores TP lines for stages nextStage..totalStages.
+// Does not touch stages before nextStage (those have already fired and been deleted).
+//
+// Price resolution order:
+//   1. If a saved GV price exists for this stage (set by OnChartEvent drag or
+//      OnDeinit save), that price is used — preserving the user's custom placement.
+//   2. Otherwise the formula StagePriceFromEntry is used.
+//
+// This function is called:
+//   • In OnInit (initial draw + re-attach restore)
+//   • After each partial close (to redraw remaining lines)
+//   • In OnTick at the start of each tick (idempotent: noop if lines already exist)
 void EnsureTPLines(const bool isBuy, const double entry,
                    const int totalStages, const int nextStage,
                    const double intervalPts, const double factor,
@@ -410,7 +496,29 @@ void EnsureTPLines(const bool isBuy, const double entry,
     DeleteIfExists(TPLineName(s));
 }
 
-// ====== Close sizing with look-ahead (never skip) ======
+// ====== ChooseClosablePiece: staged partial-close volume calculator ======
+//
+// Determines how many lots to close at stage 'stage' of 'totalStages'.
+// The target is initLots / totalStages per stage (equal N-way split), rounded
+// to lot-step. A "look-ahead" guard ensures the leftover after this close is
+// always >= minLot; if not, the current close absorbs the would-be orphan.
+//
+// Parameters:
+//   initLots    – original position volume at entry (from GV_InitLots)
+//   stage       – current stage number (1-based)
+//   totalStages – total number of TP stages (== GetMaxStagesGV)
+//   lotStep     – SYMBOL_VOLUME_STEP (broker lot granularity)
+//   minLot      – SYMBOL_VOLUME_MIN  (broker minimum tradeable volume)
+//   remaining   – current open position volume (from POSITION_VOLUME)
+//
+// Return value: volume to close, or 0.0 if remaining is already 0.
+//
+// Final-stage logic (stage >= totalStages):
+//   Close exactly what the broker reports as remaining.
+//   NormalizeDouble first scrubs floating-point dust accumulated across partial
+//   closes (e.g. 0.2999999… → 0.30). Then FloorToLotStep (not Round) to keep
+//   the volume <= remaining by definition — sending a volume above remaining
+//   returns TRADE_RETCODE_INVALID_VOLUME on strict servers.
 double ChooseClosablePiece(const double initLots, const int stage, const int totalStages,
                            const double lotStep, const double minLot, const double remaining)
 {
@@ -459,6 +567,17 @@ double ChooseClosablePiece(const double initLots, const int stage, const int tot
 }
 
 // ===================== Panel =====================
+// The panel is a set of OBJ_LABEL objects drawn in the top-left corner of the
+// chart (CORNER_LEFT_UPPER). Labels are created once and updated each tick.
+// DeletePanel() removes all panel labels cleanly on EA removal or full close.
+//
+// Panel rows (row 0 = top):
+//   Row 0: Remaining size    – current % of initial lots still open
+//   Row 1: Locked in         – cumulative normalised points locked across all closes
+//   Row 2: Stop Loss         – distance to current SL; estimated points if hit now
+//   Row 3: Next TP           – distance to next TP; lots closed; locked-in contribution
+//   Row 4: (continuation)    – second line of Next TP detail
+//   Row 5: Outcome if closed now – estimated final score at current price
 #define PANEL_CORNER             0
 #define PANEL_XDIST              15
 #define PANEL_YDIST              30
@@ -482,6 +601,9 @@ double ChooseClosablePiece(const double initLots, const int stage, const int tot
 #define L_NOW_HDR   "EA_NowHdr"
 #define L_NOW_VAL   "EA_NowVal"
 
+// LotsPrecisionFromStep: computes the number of decimal places needed to
+// represent SYMBOL_VOLUME_STEP exactly (e.g. 0.01 → 2, 0.001 → 3).
+// Used to format lot sizes in the panel without unnecessary trailing zeros.
 int LotsPrecisionFromStep(double step){
   if(step <= 0) return 2;
   int prec = 0; double s = step;
@@ -502,7 +624,7 @@ void CreateOrUpdateLabelRaw(const string name, const string text, int corner, in
     ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
     ObjectSetInteger(0, name, OBJPROP_BACK,      0);
   }
-  ObjectSetText(0, name, text, size, font, c);
+  ObjectSetText(name, text, size, font, c);
 }
 void CreateOrUpdateHeader(const string name, const string text, int row){
   int y = PANEL_YDIST + row*PANEL_SPACING;
@@ -525,6 +647,22 @@ void ShowExternalCloseStatus(){
 }
 
 // ===================== Update Panel =====================
+// UpdatePanel: redraws all panel labels with current position state.
+// Called on every tick (tradeActive=true) and after a close event (tradeActive=false).
+//
+// When tradeActive=true:
+//   Selects the managed position, reads current lots/entry/SL/price, computes
+//   all panel values, and calls EnsureTPLines to keep lines in sync.
+//
+// When tradeActive=false:
+//   Reads the last-known ticket from GV_LastTicket to display the final
+//   locked-in total; all other live fields show "(trade closed)".
+//
+// "Normalised points" (locked in / stop-loss outcome):
+//   Rather than raw points for the total position, the EA tracks contribution
+//   per-close as:  points × (closeVol / initLots)
+//   This gives a per-unit-of-initial-exposure score that adds up consistently
+//   across stages regardless of the varying close volumes.
 void UpdatePanel(const bool tradeActive){
   DeleteIfExists(LEGACY_LABEL_NAME);
 
@@ -638,6 +776,28 @@ void UpdatePanel(const bool tradeActive){
 }
 
 // ===================== OnInit =====================
+// Entry point called by MT5 when the EA is first attached or reinitialised.
+// Responsibilities:
+//   1. Validate inputs and symbol support (returns INIT_FAILED on any error).
+//   2. Guard against conflict: refuse to start if another position is open on
+//      this symbol and it is NOT managed by this EA (no double-up).
+//   3. Open a new position if none exists: size it, place the entry order,
+//      create TP lines, and initialise all GVs.
+//   4. Re-attach to an existing position: restore TP lines from GVs (preserving
+//      dragged positions), validate GV state.
+//   5. Draw the panel for the initial state.
+//
+// [BROKER-SPECIFIC] Lot sizing formula:
+//   riskAmt = balance × (Contracts / 100.0)   ← 1% of balance per contract
+//   lots    = FloorToLotStep(riskAmt / distPts)
+//
+//   This is calibrated for SPX500(€) on IG where each lot is worth roughly
+//   £1/point in account currency. Contracts=2, DistancePts=10 →
+//   riskAmt = balance × 0.02; lots = riskAmt / 10.
+//   For FX or other instruments the sizing formula must be replaced with a
+//   proper pip-value-based calculation:
+//     lots = (balance × riskPct) / (pipValue × stopLossInPips)
+//   where pipValue = lotSize × SYMBOL_POINT × ContractSize / exchangeRate.
 int OnInit(){
   string sym     = Symbol();
   double point   = SymbolInfoDouble(sym, SYMBOL_POINT);
@@ -680,6 +840,10 @@ int OnInit(){
       lots = maxLot;
     }
 
+  // Open new position — size, cap, and send.
+  // [BROKER-SPECIFIC] "SPX" is the order comment visible in IG's trade blotter
+  // and MT5 history. Change to match your preferred instrument/strategy label.
+  // Some brokers restrict comment length or content; IG accepts short strings.
     ENUM_ORDER_TYPE type = (BUY_SELL==Buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
     posTicket = SendMarketOrderGentleAdaptive(sym, type, lots, distPts, factor,
                                              SLIPPAGE_POINTS, "SPX", MAGIC,
@@ -726,9 +890,18 @@ int OnInit(){
 }
 
 // ===================== OnDeinit =====================
-// Saves current TP line positions to GVs before deleting, so dragged positions
-// survive the deinit/init cycle caused by timeframe changes or EA reattach.
-// Panel labels are intentionally left so final values remain visible.
+// Called by MT5 before the EA is removed (chart close, timeframe change, manual
+// removal, init failure, etc.). The 'reason' code is available but not used here
+// because the same save-and-clean logic is correct for all removal reasons.
+//
+// What this does:
+//   1. Saves the current screen position of every TP line to a GV
+//      ("EA_TP_PRICE_<ticket>_<stage>"). If the user dragged a line, the
+//      dragged price is already in the GV from OnChartEvent; this call
+//      ensures even un-dragged lines survive the deinit/init round-trip.
+//   2. Deletes all TP lines from the chart (they will be redrawn by OnInit).
+//   3. Panel labels are intentionally NOT deleted so the user can read the
+//      final values during the reinitialisation gap.
 void OnDeinit(const int reason){
   ulong lastTicket = GetLastTicket();
   if(lastTicket > 0){
@@ -744,6 +917,18 @@ void OnDeinit(const int reason){
 }
 
 // ===================== OnTick =====================
+// Main tick handler. Called on every new price quote.
+//
+// Execution flow:
+//   1. Find the managed position. If gone and we were active → external close
+//      (SL or manual): show status, clean up, ExpertRemove.
+//   2. If position exists, select it and read state.
+//   3. Determine next-stage TP line price and check if price has hit it.
+//   4. If not hit: call UpdatePanel(true) and return. (Fast path, most ticks.)
+//   5. If hit: run ChooseClosablePiece with look-ahead collapse detection,
+//      call CloseGentle, update GV_LockedPts, advance stage.
+//   6. If all stages done or position now fully closed: clean up GVs, remove
+//      TP lines, UpdatePanel(false), ExpertRemove.
 void OnTick(){
   string sym = Symbol();
   ENUM_POSITION_TYPE wantType = (BUY_SELL==Buy ? POSITION_TYPE_BUY : POSITION_TYPE_SELL);
@@ -800,8 +985,9 @@ void OnTick(){
   bool   hit    = isBuy ? (bidNow>=tpPx) : (askNow<=tpPx);
   if(!hit) return;
 
-  // Re-select position: UpdatePanel internally iterates positions by index, which changes the
-  // implicit position context. Re-select here to ensure all reads below reference our position.
+  // Re-select position after UpdatePanel: UpdatePanel iterates positions by
+  // index, which changes the implicit position context. Re-select here so all
+  // reads below (POSITION_VOLUME, POSITION_PRICE_OPEN) reference our position.
   if(!PositionSelectByTicket(posTicket)){ UpdatePanel(false); return; }
 
   double initLots    = GetInitLotsGV(ticket);
@@ -882,8 +1068,20 @@ void OnTick(){
 }
 
 // ===================== OnChartEvent =====================
+// Called by MT5 on user interactions with chart objects. We handle only the
+// CHARTEVENT_OBJECT_DRAG event for TP_Line_* objects (user drags a TP line).
+//
+// When a TP line is dragged:
+//   1. The new price is read from the object's OBJPROP_PRICE.
+//   2. The price is immediately saved to the per-stage GV
+//      ("EA_TP_PRICE_<ticket>_<stage>"). This ensures the dragged position
+//      survives a subsequent deinit/init cycle (timeframe change etc.),
+//      since EnsureTPLines checks this GV before using the formula.
+//
+// Note: the stage number is extracted by stripping the "TP_Line_" prefix (8 chars)
+// from the object name and converting the remainder to an integer.
 void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam){
-  (void)lparam; (void)dparam; // required by MT5 callback signature; not used for drag events
+  // lparam and dparam are not used for CHARTEVENT_OBJECT_DRAG (sparam carries the object name)
   if(id==CHARTEVENT_OBJECT_DRAG && StringFind(sparam,"TP_Line_",0)==0){
     if(PRINT_DEBUG)
       Print(sparam," moved to ",
