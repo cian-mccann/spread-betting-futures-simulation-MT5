@@ -290,8 +290,8 @@ bool IsTransientRetcode(const int retcode){
 // handle the case where no mode is advertised separately.
 ENUM_ORDER_TYPE_FILLING GetFillMode(const string sym){
   int filling = (int)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
-  if(filling & (int)SYMBOL_FILLING_FOK) return ORDER_FILLING_FOK;
-  if(filling & (int)SYMBOL_FILLING_IOC) return ORDER_FILLING_IOC;
+  if((filling & (int)SYMBOL_FILLING_FOK) != 0) return ORDER_FILLING_FOK;
+  if((filling & (int)SYMBOL_FILLING_IOC) != 0) return ORDER_FILLING_IOC;
   return ORDER_FILLING_RETURN;  // [BROKER-SPECIFIC] IG default (filling mode = 0)
 }
 
@@ -624,7 +624,10 @@ void CreateOrUpdateLabelRaw(const string name, const string text, int corner, in
     ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
     ObjectSetInteger(0, name, OBJPROP_BACK,      0);
   }
-  ObjectSetText(name, text, size, font, c);
+  ObjectSetString(0, name, OBJPROP_TEXT, text);
+  ObjectSetInteger(0, name, OBJPROP_FONTSIZE, size);
+  ObjectSetString(0, name, OBJPROP_FONT, font);
+  ObjectSetInteger(0, name, OBJPROP_COLOR, c);
 }
 void CreateOrUpdateHeader(const string name, const string text, int row){
   int y = PANEL_YDIST + row*PANEL_SPACING;
