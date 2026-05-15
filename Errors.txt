@@ -1,0 +1,26 @@
+Trade.mq5			
+'void' - illegal use of 'void' type	Trade.mq5	886	4
+'(void*)' - invalid cast operation	Trade.mq5	886	3
+expression has no effect	Trade.mq5	886	3
+'void' - illegal use of 'void' type	Trade.mq5	886	18
+'(void*)' - invalid cast operation	Trade.mq5	886	17
+expression has no effect	Trade.mq5	886	17
+implicit conversion from 'bool' to 'string'	Trade.mq5	81	53
+implicit conversion from 'bool' to 'string'	Trade.mq5	81	80
+expression not boolean	Trade.mq5	276	14
+expression not boolean	Trade.mq5	277	14
+undeclared identifier 'position'	Trade.mq5	363	14
+undeclared identifier 'position'	Trade.mq5	363	46
+undeclared identifier 'ObjectSetText'	Trade.mq5	505	3
+',' - unexpected token	Trade.mq5	505	18
+'0' - some operator expected	Trade.mq5	505	17
+',' - unexpected token	Trade.mq5	505	24
+',' - unexpected token	Trade.mq5	505	30
+expression has no effect	Trade.mq5	505	26
+',' - unexpected token	Trade.mq5	505	36
+expression has no effect	Trade.mq5	505	32
+',' - unexpected token	Trade.mq5	505	42
+expression has no effect	Trade.mq5	505	38
+')' - unexpected token	Trade.mq5	505	45
+expression has no effect	Trade.mq5	505	44
+14 errors, 10 warnings		14	10
