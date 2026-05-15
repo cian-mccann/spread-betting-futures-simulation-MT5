@@ -1,4 +1,1 @@
-Trade.mq5			
-undeclared identifier 'position'	Trade.mq5	431	14
-undeclared identifier 'position'	Trade.mq5	431	46
-2 errors, 0 warnings		2	0
+
