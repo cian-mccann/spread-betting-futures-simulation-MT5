@@ -1,15 +1,4 @@
-expression not boolean	Trade.mq5	293	14
-expression not boolean	Trade.mq5	294	14
+Trade.mq5			
 undeclared identifier 'position'	Trade.mq5	431	14
 undeclared identifier 'position'	Trade.mq5	431	46
-undeclared identifier 'ObjectSetText'	Trade.mq5	627	3
-',' - unexpected token	Trade.mq5	627	21
-'name' - some operator expected	Trade.mq5	627	17
-',' - unexpected token	Trade.mq5	627	27
-',' - unexpected token	Trade.mq5	627	33
-expression has no effect	Trade.mq5	627	29
-',' - unexpected token	Trade.mq5	627	39
-expression has no effect	Trade.mq5	627	35
-')' - unexpected token	Trade.mq5	627	42
-expression has no effect	Trade.mq5	627	41
-9 errors, 5 warnings		9	5
+2 errors, 0 warnings		2	0
